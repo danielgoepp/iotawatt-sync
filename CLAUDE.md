@@ -42,6 +42,13 @@ python vm_iotawatt_transform.py
 docker build -t iotawatt-sync .
 ```
 
+**Build on the dev server and push to GHCR (ghcr.io/danielgoepp/iotawatt-sync):**
+```bash
+./build-and-push.sh
+```
+
+Images are published to GitHub Container Registry (not Docker Hub), tagged `:latest` and `:<git-short-sha>`. Requires a one-time `docker login ghcr.io -u danielgoepp` with a PAT that has `write:packages`.
+
 **Install dependencies:**
 ```bash
 pip install -r requirements.txt
