@@ -47,7 +47,7 @@ docker build -t iotawatt-sync .
 ./build-and-push.sh
 ```
 
-Images are published to GitHub Container Registry (not Docker Hub), tagged `:latest` and `:<git-short-sha>`. Requires a one-time `docker login ghcr.io -u danielgoepp` with a PAT that has `write:packages`.
+Images are published to GitHub Container Registry (not Docker Hub), tagged `:latest` and `:<git-short-sha>`. CI (`.github/workflows/docker-image.yml`) builds on every push/PR and pushes to GHCR on pushes to `main` using `GITHUB_TOKEN`. Running `build-and-push.sh` manually requires a one-time `docker login ghcr.io -u danielgoepp` with a PAT that has `write:packages`.
 
 **Install dependencies:**
 ```bash
