@@ -4,26 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Python-based IoTaWatt data synchronization system that transfers electrical monitoring data from IoTaWatt units to VictoriaMetrics time series database. The project consists of two main scripts for handling historical data migration and ongoing synchronization.
+Python scripts that move electrical monitoring data from IoTaWatt units into a VictoriaMetrics time series database. Only the sync daemon is actively used; the transform script was a one-time migration.
 
 ## Architecture
 
 **Core Components:**
-- `vm_iotawatt_sync.py` - Continuous sync daemon that runs every 5 minutes to pull new data
-- `vm_iotawatt_transform.py` - One-time historical data loader for initial migration
-- Both scripts use the same measurement configuration and tagging logic
+- `vm_iotawatt_sync.py` - Long-running sync daemon (the only script in the Docker image). Every 5 minutes it pulls new data from the IoTaWatt units and imports it into VictoriaMetrics.
+- `vm_iotawatt_transform.py` - One-time migration, already run. It does **not** talk to IoTaWatt: it reads the older `Power_<measurement>` series (from the InfluxDB era) out of VictoriaMetrics via `/api/v1/query_range` and re-imports them as `power{...}` with the same labels the sync script uses. Hardcoded end date `2025-01-31`.
+- The measurement list and tagging rules are duplicated in both scripts. Change the sync script; the transform script is not maintained.
 
-**Data Flow:**
-1. Query IoTaWatt units via HTTP API (`http://{host}.goepp.net/query`)
-2. Transform raw power measurements into VictoriaMetrics JSON format
-3. Apply device-specific tags (trunk/circuit classification, HVAC grouping, solar pairing)
-4. Write to VictoriaMetrics via `/api/v1/import` endpoint
+**Sync data flow (`vm_iotawatt_sync.py`):**
+1. For each measurement, find the last stored sample: `max(tlast_over_time(power{location="X"}[30d]))`
+2. Query the IoTaWatt (`http://{host}.goepp.net/query`) starting one 1m group after that sample, `group=1m`, paged with `limit=5000` (the response's `limit` field gives the next `begin`)
+3. Build labels with `build_labels()` and import to VictoriaMetrics via `/api/v1/import`
 
 **System Configuration:**
-- Two IoTaWatt units: `iwatt5` (main/trunk data from 2021-09-18) and `iwatt6` (circuit data from 2023-02-05)
+- Two IoTaWatt units: `iwatt5` (trunks and some circuits, data from 2021-09-18) and `iwatt6` (circuits, data from 2023-02-05)
 - VictoriaMetrics endpoint: `https://vms-prod-lt.goepp.net`
-- All data downsampled to 1-minute resolution
-- Sync looks back 30 days maximum for last data point
+- All data stored at 1-minute resolution, minute-aligned timestamps
+- Environment overrides for the sync script: `VICTORIAMETRICS_URL`, `IOTAWATT_DOMAIN`, `SYNC_INTERVAL` (seconds)
 
 ## Development Commands
 
@@ -32,7 +31,7 @@ This is a Python-based IoTaWatt data synchronization system that transfers elect
 python vm_iotawatt_sync.py
 ```
 
-**Run historical data loader:**
+**Run the one-time migration (not normally needed):**
 ```bash
 python vm_iotawatt_transform.py
 ```
@@ -47,7 +46,7 @@ docker build -t iotawatt-sync .
 ./build-and-push.sh
 ```
 
-Images are published to GitHub Container Registry (not Docker Hub), tagged `:latest` and `:<git-short-sha>`. CI (`.github/workflows/docker-image.yml`) builds on every push/PR and pushes to GHCR on pushes to `main` using `GITHUB_TOKEN`. Running `build-and-push.sh` manually requires a one-time `docker login ghcr.io -u danielgoepp` with a PAT that has `write:packages`.
+Images are published to GitHub Container Registry (not Docker Hub), tagged `:latest` and `:<git-short-sha>`. CI (`.github/workflows/docker-image.yml`) builds on every push/PR and pushes to GHCR on pushes to `main` using `GITHUB_TOKEN`. Running `build-and-push.sh` manually requires a one-time `docker login ghcr.io -u danielgoepp` with a PAT that has `write:packages`. It refuses to push from a dirty working tree unless `ALLOW_DIRTY=1`; `NO_PUSH=1` builds only.
 
 **Install dependencies:**
 ```bash
@@ -56,21 +55,18 @@ pip install -r requirements.txt
 
 ## Key Implementation Details
 
-**Measurement Configuration:**
-- Measurements are defined in `measurements_all` dictionary with device-specific lists
-- Each measurement gets tagged with location, device, source, and type-specific metadata
+**Labels (`build_labels()`):**
+- Every series: `__name__="power"`, `location=<measurement>`, `device=<host>`, `source="iotawatt"`
+- `Mains_*`, `SolarA_*`, `SolarB_*`, `Garage_*` → `type="Trunk"`, `pair=<prefix>`; `Solar*` also gets `solar="Both"`
+- `Minisplit*`, `OfficeHeat`, `BathroomHeat`, `Furnace` → `hvac="True"`; `Minisplit*` also gets `minisplit="True"`
+- Everything else → `type="Circuit"`
 
-**Tagging Logic:**
-- `Mains_*`, `SolarA_*`, `SolarB_*`, `Garage_*` → trunk circuits with pair grouping
-- `Minisplit*`, `*Heat`, `Furnace` → HVAC classification
-- All others → circuit classification
+**Error handling (sync):**
+- All HTTP calls have timeouts (`REQUEST_TIMEOUT`).
+- If VictoriaMetrics can't be queried for the last sample, that measurement is skipped for this run. The fallback start date is only used when VM really has no data in the last 30 days (this re-pulls full history, so expect a long catch-up).
+- If an import fails, paging stops for that measurement so later pages can't move the last-sample time past a gap; the next run retries from the last stored sample.
+- Failures for one measurement don't stop the others.
 
-**Error Handling:**
-- Sync script continues on individual measurement failures
-- Historical loader processes data in 7-day chunks to handle large datasets
-- Both scripts include comprehensive logging and exception handling
-
-**API Integration:**
-- IoTaWatt uses query parameters for time ranges, grouping, and limits
-- VictoriaMetrics expects specific JSON format with metric, values, and timestamps arrays
-- Sync script handles pagination via IoTaWatt's `limit` response field
+**Gotchas:**
+- The next IoTaWatt query must start a whole group (60s) after the last sample. A non-aligned `begin` makes IoTaWatt return an extra off-grid sample at that exact time.
+- Re-importing the same timestamp into VictoriaMetrics creates duplicate samples unless VM runs with `-dedup.minScrapeInterval`.

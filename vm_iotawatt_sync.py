@@ -1,13 +1,39 @@
-from datetime import datetime
-import requests
+"""Continuously sync IoTaWatt power readings into VictoriaMetrics.
+
+Every SYNC_INTERVAL seconds, for each measurement: find the last sample stored
+in VictoriaMetrics, fetch newer 1-minute data from the IoTaWatt unit, and
+import it into VictoriaMetrics.
+"""
+
 import json
 import logging
+import os
 import time
 
-logging.basicConfig(level=logging.INFO)
+import requests
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-victoriametrics_server = "https://vms-prod-lt.goepp.net"
+VICTORIAMETRICS_URL = os.environ.get(
+    "VICTORIAMETRICS_URL", "https://vms-prod-lt.goepp.net"
+)
+IOTAWATT_DOMAIN = os.environ.get("IOTAWATT_DOMAIN", "goepp.net")
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "300"))
+LOOKBACK = "30d"  # how far back to search VictoriaMetrics for the last sample
+GROUP_SECONDS = 60  # IoTaWatt query resolution ("1m")
+PAGE_LIMIT = 5000  # rows per IoTaWatt query
+REQUEST_TIMEOUT = (5, 60)  # (connect, read) seconds
+
+# Where to start when a measurement has no data in VictoriaMetrics.
+HOST_START_DATES = {
+    "iwatt5": "2021-09-18",
+    "iwatt6": "2023-02-05",
+}
+
 measurements_all = {
     "iwatt5": [
         "Mains_1",
@@ -43,157 +69,141 @@ measurements_all = {
     ],
 }
 
+TRUNK_PAIRS = ("Mains", "SolarA", "SolarB", "Garage")
+HVAC_PREFIXES = ("Minisplit", "OfficeHeat", "BathroomHeat", "Furnace")
 
-def write_to_vm(host, measurement, data):
-    metric = {}
-    values = []
-    timestamps = []
 
-    metric["__name__"] = "power"
-    metric["location"] = measurement
-    metric["source"] = "iotawatt"
-    metric["device"] = host
+def build_labels(host, measurement):
+    """Return the VictoriaMetrics label set for a measurement."""
+    labels = {
+        "__name__": "power",
+        "location": measurement,
+        "source": "iotawatt",
+        "device": host,
+        "type": "Circuit",
+    }
 
-    if measurement.startswith("Mains"):
-        metric["pair"] = "Mains"
-        metric["type"] = "Trunk"
-    if measurement.startswith("SolarA"):
-        metric["pair"] = "SolarA"
-        metric["type"] = "Trunk"
-    if measurement.startswith("SolarB"):
-        metric["pair"] = "SolarB"
-        metric["type"] = "Trunk"
+    for pair in TRUNK_PAIRS:
+        if measurement.startswith(pair):
+            labels["pair"] = pair
+            labels["type"] = "Trunk"
     if measurement.startswith("Solar"):
-        metric["solar"] = "Both"
-    if measurement.startswith("Garage"):
-        metric["pair"] = "Garage"
-        metric["type"] = "Trunk"
+        labels["solar"] = "Both"
+    if measurement.startswith(HVAC_PREFIXES):
+        labels["hvac"] = "True"
     if measurement.startswith("Minisplit"):
-        metric["hvac"] = "True"
-        metric["minisplit"] = "True"
-    if measurement.startswith("OfficeHeat"):
-        metric["hvac"] = "True"
-    if measurement.startswith("BathroomHeat"):
-        metric["hvac"] = "True"
-    if measurement.startswith("Furnace"):
-        metric["hvac"] = "True"
+        labels["minisplit"] = "True"
 
-    if "type" not in metric:
-        metric["type"] = "Circuit"
+    return labels
 
-    for entry in data:
-        values.append(float(entry[1]))
-        timestamps.append(int(entry[0] * 1000))
 
+def write_to_vm(host, measurement, rows):
+    """Import IoTaWatt [unix_seconds, watts] rows. Returns True on success."""
     data_point = {
-        "metric": metric,
-        "values": values,
-        "timestamps": timestamps,
+        "metric": build_labels(host, measurement),
+        "values": [float(value) for _, value in rows],
+        "timestamps": [int(ts * 1000) for ts, _ in rows],
     }
 
     try:
-        write_response = requests.post(
-            f"{victoriametrics_server}/api/v1/import",
+        response = requests.post(
+            f"{VICTORIAMETRICS_URL}/api/v1/import",
             data=json.dumps(data_point),
             headers={"Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT,
         )
-        write_response.raise_for_status()
-
+        response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error during API request: {e}")
+        logger.error(f"Write to VictoriaMetrics failed for {measurement}: {e}")
+        return False
+    return True
 
 
-## Get the last time data was fetched
-def vm_get_last_time(measurment):
+def vm_get_last_time(measurement):
+    """Return the unix time of the newest stored sample, or None if there is none.
 
-    try:
-        params = {
-            "query": f'tlast_over_time(power{{location="{measurment}"}})',
-            "step": "30d",
-        }
+    Raises requests.exceptions.RequestException if VictoriaMetrics can't be
+    queried, so callers can tell "no data" apart from "VM unavailable".
+    """
+    params = {
+        "query": f'max(tlast_over_time(power{{location="{measurement}"}}[{LOOKBACK}]))'
+    }
+    response = requests.get(
+        f"{VICTORIAMETRICS_URL}/api/v1/query", params=params, timeout=REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
 
-        response = requests.get(f"{victoriametrics_server}/api/v1/query", params=params)
-
-        if response.status_code != 200:
-            raise Exception(f"Error fetching data: {response.text}")
-
-        if not response.json()["data"]["result"]:
-            raise Exception(f"No data found for {measurment}")
-
-        start_time = int(response.json()["data"]["result"][0]["value"][1])
-        return start_time
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error during API request: {e}")
-    except Exception as e:
-        logger.error(f"Error processing data: {e}")
+    result = response.json()["data"]["result"]
+    if not result:
+        return None
+    return int(float(result[0]["value"][1]))
 
 
-## Get the data from IoTaWatt
-def vm_get_iotawatt_data(host, measurement, start_time):
-
-    response = {}
+def vm_get_iotawatt_data(host, measurement, begin):
+    """Fetch data from IoTaWatt starting at `begin` and write it to VM, page by page."""
     query_params = {
         "select": f"[time.utc.unix,{measurement}]",
-        "begin": start_time,
+        "begin": begin,
         "end": "s",
         "group": "1m",
         "missing": "skip",
-        "limit": "5000",
+        "limit": str(PAGE_LIMIT),
         "header": "yes",
     }
 
     while True:
-        if response != {}:
-            if "limit" in response.json().keys():
-                query_params["begin"] = response.json()["limit"]
-            else:
-                break
-
-        if isinstance(query_params["begin"], str):
-            show_time = query_params["begin"]
-        else:
-            show_time = datetime.fromtimestamp(query_params["begin"])
-
-        # logger.info(f"Transferring {measurement} from {show_time} on {host}")
-
         try:
             response = requests.get(
-                f"http://{host}.goepp.net/query", params=query_params
+                f"http://{host}.{IOTAWATT_DOMAIN}/query",
+                params=query_params,
+                timeout=REQUEST_TIMEOUT,
             )
+            response.raise_for_status()
+            body = response.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.error(f"Failed to fetch {measurement} from {host}: {e}")
+            return
 
-            if response.status_code != 200:
-                raise Exception(f"Error fetching data: {response.text}")
+        rows = body.get("data", [])
+        if not rows:
+            logger.debug(f"No new data for {measurement}")
+            return
 
-            if response.json()["data"] == []:
-                raise Exception("No new data available")
+        # Stop paging on a failed write; otherwise later pages would advance
+        # the last-sample time in VM and leave a permanent gap.
+        if not write_to_vm(host, measurement, rows):
+            return
 
-            write_to_vm(host, measurement, response.json()["data"])
+        if "limit" not in body:
+            return
+        query_params["begin"] = body["limit"]
 
-        except Exception as e:
-            logger.error(f"Failed to fetch data from IoTaWatt: {str(e)}")
-            break
 
-        # time.sleep(1)
+def sync_once():
+    for host, measurements in measurements_all.items():
+        for measurement in measurements:
+            try:
+                last_time = vm_get_last_time(measurement)
+            except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+                # Don't fall back to the start date here: that would re-pull the
+                # full history from the IoTaWatt whenever VM is briefly unavailable.
+                logger.error(f"Skipping {measurement}: can't read last time from VM: {e}")
+                continue
+
+            if last_time is not None:
+                # Start at the next 1m group so samples stay minute-aligned.
+                begin = last_time + GROUP_SECONDS
+            else:
+                begin = HOST_START_DATES[host]
+                logger.warning(
+                    f"No data in the last {LOOKBACK} for {measurement} - starting from {begin}"
+                )
+            vm_get_iotawatt_data(host, measurement, begin)
 
 
 if __name__ == "__main__":
-
     while True:
-        logger.info(f"Running sync {datetime.now().isoformat('T', 'seconds')}")
-        for host, measurements in measurements_all.items():
-            for measurement in measurements:
-                start_time = vm_get_last_time(measurement)
-                if start_time is not None:
-                    vm_get_iotawatt_data(host, measurement, start_time + 5)
-                else:
-                    if host == "iwatt6":
-                        start_time = "2023-02-05"
-                    elif host == "iwatt5":
-                        start_time = "2021-09-18"
-                    logger.warning(
-                        f"No last time found for {measurement} - using {start_time}"
-                    )
-                    vm_get_iotawatt_data(host, measurement, start_time)
-        logger.info(f"Done at {datetime.now().isoformat('T', 'seconds')} - Sleep 5m")
-        time.sleep(300)
+        logger.info("Running sync")
+        sync_once()
+        logger.info(f"Done - sleeping {SYNC_INTERVAL}s")
+        time.sleep(SYNC_INTERVAL)

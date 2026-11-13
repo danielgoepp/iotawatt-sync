@@ -60,7 +60,7 @@ def get_time_chunks(start_time, end_time, chunk_size_days):
 
 if __name__ == "__main__":
 
-    vm_url = f"https://vms-prod-lt.goepp.net/"
+    vm_url = "https://vms-prod-lt.goepp.net"
     end_time = "2025-01-31T23:59:59+00:00"
     source_step = "1m"
     target_step = "1m"
@@ -89,12 +89,9 @@ if __name__ == "__main__":
                     }
 
                     response = requests.get(
-                        f"{vm_url}api/v1/query_range", params=params
+                        f"{vm_url}/api/v1/query_range", params=params
                     )
                     response.raise_for_status()
-
-                    if response.status_code != 200:
-                        raise Exception(f"Error fetching data: {response.text}")
 
                     if (
                         "data" not in response.json()
